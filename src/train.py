@@ -8,10 +8,10 @@ from data import LowLightDataset
 # ------------------
 # Config
 # ------------------
-BATCH_SIZE = 8
-EPOCHS = 5
+BATCH_SIZE = 4
+EPOCHS = 30
 LR = 1e-4
-IMG_SIZE = 128
+IMG_SIZE = 256
 
 TRAIN_LOW = "dataset/train/low"
 TRAIN_HIGH = "dataset/train/high"
