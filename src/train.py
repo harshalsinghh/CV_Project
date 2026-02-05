@@ -10,7 +10,7 @@ from pytorch_msssim import ssim
 # Config
 # ------------------
 BATCH_SIZE = 4
-EPOCHS = 30
+EPOCHS = 40
 LR = 1e-4
 IMG_SIZE = 256
 SSIM_WEIGHT = 0.5
