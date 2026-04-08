@@ -1,84 +1,81 @@
-import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from model import UNetEnhancer
-from data import LowLightDataset
 from pytorch_msssim import ssim
+from src.model import UNetEnhancer
+from src.data import LowLightDataset
 
-# ------------------
-# Config
-# ------------------
-BATCH_SIZE = 4
-EPOCHS = 40
-LR = 1e-4
-IMG_SIZE = 256
+# ── Config ──────────────────────────────────────────
+BATCH_SIZE  = 4
+EPOCHS      = 40
+LR          = 1e-4
+IMG_SIZE    = 256
 SSIM_WEIGHT = 0.5
+TRAIN_LOW   = "dataset/train/low"
+TRAIN_HIGH  = "dataset/train/high"
 
-TRAIN_LOW = "dataset/train/low"
-TRAIN_HIGH = "dataset/train/high"
+# ── Noise-Adaptive Weighted Loss ────────────────────
+class NoiseAdaptiveLoss(nn.Module):
+    """
+    Spatially weights L1 loss by local darkness.
+    Darker pixels get higher weight since they are
+    harder to reconstruct and more noise-affected.
+    """
+    def __init__(self, ssim_weight=0.5):
+        super().__init__()
+        self.ssim_weight = ssim_weight
+        self.l1 = nn.L1Loss(reduction='none')
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("Torch CUDA available:", torch.cuda.is_available())
-print("Using device:", device)
+    def forward(self, output, target, input_low):
+        # Brightness map from low-light input
+        brightness = input_low.mean(dim=1, keepdim=True)  # [B,1,H,W]
 
-# ------------------
-# Dataset & Loader
-# ------------------
-dataset = LowLightDataset(
-    low_dir=TRAIN_LOW,
-    high_dir=TRAIN_HIGH,
-    img_size=IMG_SIZE
-)
+        # Darker = higher weight (floor at 0.1 to avoid instability)
+        weight = (1.0 - brightness + 0.1)
+        weight = weight / weight.mean()  # normalize so average weight = 1
 
-loader = DataLoader(
-    dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=0,
-    pin_memory=False
-)
+        # Weighted L1
+        l1_map = self.l1(output, target).mean(dim=1, keepdim=True)
+        weighted_l1 = (weight * l1_map).mean()
 
-# ------------------
-# Model, Loss, Optim
-# ------------------
-model = UNetEnhancer().to(device)
-criterion = nn.L1Loss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+        # SSIM
+        ssim_loss = 1.0 - ssim(output, target, data_range=1.0, size_average=True)
 
-# ------------------
-# Training Loop
-# ------------------
-model.train()
-for epoch in range(EPOCHS):
-    epoch_loss = 0.0
+        return weighted_l1 + self.ssim_weight * ssim_loss
 
-    for i, (low, high) in enumerate(loader):
-        if epoch == 0 and i == 0:
-            print("First batch loaded. Training has started.")
 
-        low = low.to(device)
-        high = high.to(device)
+def train(use_freq_block=True, epochs=EPOCHS, save_name="unet_enhancer.pth"):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device} | FreqBlock: {use_freq_block}")
 
-        optimizer.zero_grad()
-        output = model(low)
+    dataset = LowLightDataset(TRAIN_LOW, TRAIN_HIGH, IMG_SIZE)
+    loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                         num_workers=0, pin_memory=False)
 
-        l1_loss = criterion(output, high)
-        ssim_loss = 1 - ssim(output, high, data_range=1.0, size_average=True)
+    model     = UNetEnhancer(use_freq_block=use_freq_block).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion = NoiseAdaptiveLoss(ssim_weight=SSIM_WEIGHT)
 
-        loss = l1_loss + SSIM_WEIGHT * ssim_loss
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        for low, high in loader:
+            low, high = low.to(device), high.to(device)
+            optimizer.zero_grad()
+            out  = model(low)
+            loss = criterion(out, high, low)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step()
+        avg = total_loss / len(loader)
+        print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg:.4f} LR: {scheduler.get_last_lr()[0]:.6f}")
 
-        loss.backward()
-        optimizer.step()
+    torch.save(model.state_dict(), f"checkpoints/{save_name}")
+    print(f"Saved: checkpoints/{save_name}")
+    return model
 
-        epoch_loss += loss.item()
 
-    avg_loss = epoch_loss / len(loader)
-    print(f"Epoch [{epoch+1}/{EPOCHS}] - Avg Loss: {avg_loss:.4f}")
-
-# ------------------
-# Save Model
-# ------------------
-os.makedirs("checkpoints", exist_ok=True)
-torch.save(model.state_dict(), "checkpoints/unet_enhancer.pth")
-print("Model saved to checkpoints/unet_enhancer.pth")
+if __name__ == "__main__":
+    train()
