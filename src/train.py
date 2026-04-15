@@ -1,3 +1,6 @@
+import sys
+sys.path.append("/content/CV_Project")  # FIX: ensures imports work in Colab
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,22 +9,23 @@ from pytorch_msssim import ssim
 import torchvision.models as models
 
 from src.model import UNetEnhancer
-from src.data import LowLightDataset, SyntheticLowLightDataset
+from src.data import LowLightDataset
 
 # ── Config ──────────────────────────────────────────
 BATCH_SIZE  = 4
-EPOCHS      = 40
-PRETRAIN_EPOCHS = 10
+EPOCHS      = 10   # fast ablation
 LR          = 1e-4
 IMG_SIZE    = 256
 
 TRAIN_LOW   = "/content/CV_Project/dataset/train/low"
 TRAIN_HIGH  = "/content/CV_Project/dataset/train/high"
-SYNTHETIC_DIR = "/content/CV_Project/dataset/normal_images"
+
+# 🔥 CHANGE THIS ONLY
+MODE = "perceptual"   # baseline / perceptual / frequency / hybrid
 
 # ── Hybrid Loss ─────────────────────────────────────
 class HybridLoss(nn.Module):
-    def __init__(self, ssim_weight=0.5, perceptual_weight=0.1, freq_weight=0.1):
+    def __init__(self, ssim_weight=0.5, perceptual_weight=0.0, freq_weight=0.0):
         super().__init__()
 
         self.ssim_weight = ssim_weight
@@ -30,11 +34,14 @@ class HybridLoss(nn.Module):
 
         self.l1 = nn.L1Loss(reduction='none')
 
-        # VGG for perceptual loss
-        vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features[:16]
-        self.vgg = vgg.eval()
-        for p in self.vgg.parameters():
-            p.requires_grad = False
+        # Only load VGG if needed (saves time)
+        if perceptual_weight > 0:
+            vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features[:16]
+            self.vgg = vgg.eval()
+            for p in self.vgg.parameters():
+                p.requires_grad = False
+        else:
+            self.vgg = None
 
     def forward(self, output, target, input_low):
         # ── Noise-adaptive L1 ──
@@ -48,71 +55,54 @@ class HybridLoss(nn.Module):
         # ── SSIM ──
         ssim_loss = 1.0 - ssim(output, target, data_range=1.0, size_average=True)
 
-        # ── Perceptual Loss ──
-        feat_out = self.vgg(output)
-        feat_target = self.vgg(target)
-        perceptual_loss = F.l1_loss(feat_out, feat_target)
+        total_loss = weighted_l1 + self.ssim_weight * ssim_loss
 
-        # ── Frequency Loss ──
-        fft_out = torch.fft.fft2(output)
-        fft_target = torch.fft.fft2(target)
-        freq_loss = F.l1_loss(torch.abs(fft_out), torch.abs(fft_target))
+        # ── Perceptual ──
+        if self.perceptual_weight > 0:
+            feat_out = self.vgg(output)
+            feat_target = self.vgg(target)
+            perceptual_loss = F.l1_loss(feat_out, feat_target)
+            total_loss += self.perceptual_weight * perceptual_loss
 
-        # ── Total Loss ──
-        total_loss = (
-            weighted_l1 +
-            self.ssim_weight * ssim_loss +
-            self.perceptual_weight * perceptual_loss +
-            self.freq_weight * freq_loss
-        )
+        # ── Frequency ──
+        if self.freq_weight > 0:
+            fft_out = torch.fft.fft2(output)
+            fft_target = torch.fft.fft2(target)
+            freq_loss = F.l1_loss(torch.abs(fft_out), torch.abs(fft_target))
+            total_loss += self.freq_weight * freq_loss
 
         return total_loss
 
 
+# ── Loss Selector ───────────────────────────────────
+def get_loss(mode):
+    if mode == "baseline":
+        return HybridLoss(0.5, 0.0, 0.0), "unet_baseline.pth"
+    elif mode == "perceptual":
+        return HybridLoss(0.5, 0.1, 0.0), "unet_perceptual.pth"
+    elif mode == "frequency":
+        return HybridLoss(0.5, 0.0, 0.1), "unet_frequency.pth"
+    elif mode == "hybrid":
+        return HybridLoss(0.5, 0.1, 0.1), "unet_hybrid.pth"
+    else:
+        raise ValueError("Invalid MODE")
+
+
+# ── Training ────────────────────────────────────────
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    print(f"Device: {device} | Mode: {MODE}")
 
-    # ── Model ─────────────────────────────
     model = UNetEnhancer(use_freq_block=True).to(device)
 
-    # ── Loss ──────────────────────────────
-    criterion = HybridLoss(ssim_weight=0.5, perceptual_weight=0.1, freq_weight=0.1)
-    criterion.vgg = criterion.vgg.to(device)  # IMPORTANT
+    criterion, save_name = get_loss(MODE)
+
+    # Move VGG to GPU if used
+    if criterion.vgg is not None:
+        criterion.vgg = criterion.vgg.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
-    # =========================================================
-    # 🔥 PHASE 1: SYNTHETIC PRETRAINING
-    # =========================================================
-    print("\n🔥 Phase 1: Synthetic Pretraining")
-
-    synthetic_dataset = SyntheticLowLightDataset(SYNTHETIC_DIR, IMG_SIZE)
-    synthetic_loader  = DataLoader(synthetic_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-    for epoch in range(PRETRAIN_EPOCHS):
-        model.train()
-        total_loss = 0
-
-        for low, high in synthetic_loader:
-            low, high = low.to(device), high.to(device)
-
-            optimizer.zero_grad()
-            out = model(low)
-            loss = criterion(out, high, low)
-
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        avg = total_loss / len(synthetic_loader)
-        print(f"[Pretrain] Epoch [{epoch+1}/{PRETRAIN_EPOCHS}] Loss: {avg:.4f}")
-
-    # =========================================================
-    # 🚀 PHASE 2: REAL TRAINING
-    # =========================================================
-    print("\n🚀 Phase 2: Training on Real Dataset")
 
     dataset = LowLightDataset(TRAIN_LOW, TRAIN_HIGH, IMG_SIZE)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -130,16 +120,16 @@ def train():
 
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
 
         scheduler.step()
         avg = total_loss / len(loader)
 
-        print(f"[Train] Epoch [{epoch+1}/{EPOCHS}] Loss: {avg:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"[{MODE}] Epoch [{epoch+1}/{EPOCHS}] Loss: {avg:.4f}")
 
-    # ── Save Model ────────────────────────
-    torch.save(model.state_dict(), "checkpoints/unet_hybrid.pth")
-    print("✅ Saved: checkpoints/unet_hybrid.pth")
+    torch.save(model.state_dict(), f"checkpoints/{save_name}")
+    print(f"✅ Saved: checkpoints/{save_name}")
 
 
 if __name__ == "__main__":
