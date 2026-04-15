@@ -35,3 +35,10 @@ def evaluate(checkpoint_path, low_dir, high_dir, use_freq_block=True, label="Mod
     print(f"{'='*40}")
 
     return np.mean(psnr_list), np.mean(ssim_list)
+if __name__ == "__main__":
+    evaluate(
+        checkpoint_path="checkpoints/unet_step1_pretrained.pth",
+        low_dir="/content/CV_Project/dataset/train/low",
+        high_dir="/content/CV_Project/dataset/train/high",
+        label="Step1 Model"
+    )
