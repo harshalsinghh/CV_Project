@@ -20,11 +20,10 @@ def ablation_study(low_dir, high_dir):
     dataset = LowLightDataset(low_dir, high_dir, img_size=256)
 
     variants = [
-        ("A: L1 Only",          "checkpoints/unet_l1only.pth",    False),
-        ("B: L1+SSIM",          "checkpoints/unet_enhancer.pth",  False),
-        ("C: L1+SSIM+FreqBlock","checkpoints/unet_freqblock.pth", True),
-    ]
-
+    ("A: L1 Only",       "checkpoints/unet_l1only.pth",   False),
+    ("B: L1+SSIM+Freq",  "checkpoints/unet_variantB.pth", True),
+    ("C: Adaptive+Freq", "checkpoints/unet_variantC.pth", True),
+]
     results = {}
 
     for label, ckpt, use_freq in variants:
